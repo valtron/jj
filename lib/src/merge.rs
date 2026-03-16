@@ -118,7 +118,7 @@ impl<T: Eq> Diff<T> {
     }
 }
 
-/// Whether to resolve conflict that makes the same change at all sides.
+/// Whether to resolve a conflict that makes the same change at all sides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SameChange {

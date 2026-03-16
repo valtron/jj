@@ -46,6 +46,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt as _;
+#[cfg(feature = "git")]
+use tracing::instrument;
 
 use crate::backend::Backend;
 use crate::backend::BackendError;
@@ -76,6 +78,10 @@ use crate::file_util::BadPathEncoding;
 use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
 use crate::git::GitSettings;
+#[cfg(feature = "git")]
+use crate::gitignore::GitIgnoreError;
+#[cfg(feature = "git")]
+use crate::gitignore::GitIgnoreFile;
 use crate::index::Index;
 use crate::lock::FileLock;
 use crate::merge::Merge;
@@ -90,6 +96,8 @@ use crate::stacked_table::ReadonlyTable;
 use crate::stacked_table::TableSegment as _;
 use crate::stacked_table::TableStore;
 use crate::stacked_table::TableStoreError;
+#[cfg(feature = "git")]
+use crate::store::Store;
 
 const HASH_LENGTH: usize = 20;
 const CHANGE_ID_LENGTH: usize = 16;
@@ -962,6 +970,60 @@ fn import_extra_metadata_entries_from_heads(
         );
     }
     Ok(())
+}
+
+#[cfg(not(feature = "git"))]
+pub fn base_ignores(
+    workspace_root: &path,
+    store: &Arc<Store>,
+) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
+    Ok(GitIgnoreFile::empty())
+}
+
+#[cfg(feature = "git")]
+#[instrument(skip_all)]
+pub fn base_ignores(
+    workspace_root: &Path,
+    store: &Arc<Store>,
+) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
+    let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
+        // TODO: maybe use path() and interpolate(), which can process non-utf-8
+        // path on Unix.
+        if let Some(value) = config.string("core.excludesFile") {
+            let path = str::from_utf8(&value)
+                .ok()
+                .map(jj_lib::file_util::expand_home_path)?;
+            // The configured path is usually absolute, but if it's relative,
+            // the "git" command would read the file at the work-tree directory.
+            Some(workspace_root.join(path))
+        } else {
+            xdg_config_home().map(|x| x.join("git").join("ignore"))
+        }
+    };
+
+    fn xdg_config_home() -> Option<PathBuf> {
+        if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
+            && !x.is_empty()
+        {
+            return Some(PathBuf::from(x));
+        }
+        etcetera::home_dir().ok().map(|home| home.join(".config"))
+    }
+
+    let mut git_ignores = GitIgnoreFile::empty();
+    if let Ok(git_backend) = jj_lib::git::get_git_backend(store) {
+        let git_repo = git_backend.git_repo();
+        if let Some(excludes_file_path) = get_excludes_file_path(&git_repo.config_snapshot()) {
+            git_ignores = git_ignores.chain_with_file("", excludes_file_path)?;
+        }
+        git_ignores = git_ignores
+            .chain_with_file("", git_backend.git_repo_path().join("info").join("exclude"))?;
+    } else if let Ok(git_config) = gix::config::File::from_globals()
+        && let Some(excludes_file_path) = get_excludes_file_path(&git_config)
+    {
+        git_ignores = git_ignores.chain_with_file("", excludes_file_path)?;
+    }
+    Ok(git_ignores)
 }
 
 impl Debug for GitBackend {

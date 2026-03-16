@@ -458,7 +458,7 @@ impl Workspace {
         let mut locked_ws = self.start_working_copy_mutation()?;
         // Check if the current working-copy commit has changed on disk compared to what
         // the caller expected. It's safe to check out another commit
-        // regardless, but it's probably not what  the caller wanted, so we let
+        // regardless, but it's probably not what the caller wanted, so we let
         // them know.
         if let Some(old_tree) = old_tree
             && old_tree.tree_ids_and_labels()
