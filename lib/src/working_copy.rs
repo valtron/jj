@@ -303,6 +303,10 @@ pub enum CheckoutError {
     /// Failed to load the working copy state.
     #[error(transparent)]
     WorkingCopyStateError(#[from] WorkingCopyStateError),
+    /// There is a mismatch in the set of ignored files between the
+    /// current working copy and the one being checked out.
+    #[error("TODO: better message about ignored files being mismatched")]
+    IgnoredFilesMismatched,
     /// Some other error happened while checking out the working copy.
     #[error("{message}")]
     Other {
