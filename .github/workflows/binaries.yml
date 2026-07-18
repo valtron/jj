@@ -4,8 +4,10 @@ on:
   push:
     branches:
       - main
+      - better-ignores
 
-permissions: {}
+permissions:
+  contents: write
 
 jobs:
   binaries:
@@ -65,14 +67,34 @@ jobs:
         shell: bash
         run: |
           outdir="target/${{ matrix.target }}/release"
-          BIN=$outdir/jj
-          [[ "${{ matrix.os }}" == windows* ]] && BIN+=".exe"
+          ext=""
+          [[ "${{ matrix.os }}" == windows* ]] && ext=".exe"
 
           mkdir -p target/out
-          cp $BIN target/out
+          cp "$outdir/jj$ext" "target/out/jj-${{ matrix.target }}$ext"
 
       - name: Publish binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: jj-${{ matrix.target }}
           path: target/out
+
+  publish:
+    name: Publish latest release
+    needs: binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update latest release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: "Latest Build"
+          body: "Automated build from commit ${{ github.sha }} on ${{ github.ref_name }}."
+          prerelease: true
+          files: release-assets/*

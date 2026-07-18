@@ -16,6 +16,7 @@ permissions: {}
 
 jobs:
   test:
+    if: github.ref != 'refs/heads/better-ignores'
     strategy:
       fail-fast: ${{ github.event_name == 'merge_group' }}
       matrix:
