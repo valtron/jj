@@ -90,6 +90,7 @@ use crate::fsmonitor::FsmonitorSettings;
 use crate::fsmonitor::WatchmanConfig;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
+use crate::git_backend::base_ignores;
 use crate::gitignore::GitIgnoreFile;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
@@ -118,6 +119,7 @@ use crate::store::Store;
 use crate::working_copy::CheckoutError;
 use crate::working_copy::CheckoutStats;
 use crate::working_copy::LockedWorkingCopy;
+use crate::working_copy::MismatchReason;
 use crate::working_copy::ResetError;
 use crate::working_copy::SnapshotError;
 use crate::working_copy::SnapshotOptions;
@@ -1627,9 +1629,12 @@ impl FileSnapshotter<'_> {
                 }
             }
 
-            if git_ignore.matches_dir(&path)
-                && self.force_tracking_matcher.visit(&path).is_nothing()
-            {
+            let is_ignored = git_ignore.matches_dir(&path);
+            if is_ignored {
+                return Ok(None);
+            }
+
+            if is_ignored && self.force_tracking_matcher.visit(&path).is_nothing() {
                 // If the whole directory is ignored by .gitignore, visit only
                 // paths we're already tracking. This is because .gitignore in
                 // ignored directory must be ignored. It's also more efficient.
@@ -1656,8 +1661,13 @@ impl FileSnapshotter<'_> {
             if let Some(progress) = self.progress {
                 progress(&path);
             }
+            let is_ignored = git_ignore.matches_file(&path);
+            if is_ignored {
+                return Ok(None);
+            }
+
             if maybe_current_file_state.is_none()
-                && (git_ignore.matches_file(&path) && !self.force_tracking_matcher.matches(&path))
+                && (is_ignored && !self.force_tracking_matcher.matches(&path))
             {
                 // If it wasn't already tracked and it matches
                 // the ignored paths, then ignore it.
@@ -2859,6 +2869,12 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         // continue an interrupted update if we find such a file.
         let new_tree = commit.tree();
         let tree_state = self.wc.tree_state_mut()?;
+        let mismatched_files = find_mismatched_ignored_files(tree_state, &new_tree)?;
+        if !mismatched_files.is_empty() {
+            return Err(CheckoutError::IgnoredFilesMismatched {
+                files: mismatched_files,
+            });
+        }
         if tree_state.tree.tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
             let stats = tree_state.check_out(&new_tree)?;
             self.tree_state_dirty = true;
@@ -2940,6 +2956,431 @@ impl LockedLocalWorkingCopy {
         self.tree_state_dirty = true;
         Ok(())
     }
+}
+
+fn find_mismatched_ignored_files(
+    tree_state: &TreeState,
+    new_tree: &MergedTree,
+) -> Result<Vec<(RepoPathBuf, MismatchReason)>, CheckoutError> {
+    // Finds files in the working copy (`tree_state`) that are currently ignored,
+    // but that won't be ignored in the new tree.
+    let working_copy_path = tree_state.working_copy_path.clone();
+    let res = base_ignores(working_copy_path.as_path(), &tree_state.store);
+    if let Err(err) = res {
+        return Err(CheckoutError::Other {
+            message: "Failed to get `base_ignores`".to_string(),
+            err: Box::new(err),
+        });
+    }
+    let base_ignores = res.unwrap();
+    let disk_dir = working_copy_path.as_path();
+    let (file_tx, file_rx) = channel::<(RepoPathBuf, MismatchReason)>();
+
+    let res = trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
+        let collector = MismatchedIgnoredFilesCollector {
+            error: OnceLock::new(),
+            progress: None,
+            file_tx,
+            tree_state,
+        };
+        let directory_to_visit = DirectoryToVisit2 {
+            dir: RepoPathBuf::root(),
+            disk_dir: disk_dir.to_path_buf(),
+            git_ignore_old: base_ignores.clone(),
+            git_ignore_new: Some(base_ignores.clone()),
+            new_tree,
+            old_tree: &tree_state.tree,
+            file_states: tree_state.file_states(),
+        };
+        rayon::scope(|scope| {
+            collector.spawn_ok(scope, |scope| {
+                collector.visit_directory(directory_to_visit, scope)
+            });
+        });
+        collector.into_result()
+    });
+
+    if let Err(err) = res {
+        return Err(CheckoutError::Other {
+            message: "Failed to traverse filesystem".to_string(),
+            err: Box::new(err),
+        });
+    }
+
+    let files: HashSet<(RepoPathBuf, MismatchReason)> = HashSet::from_iter(file_rx);
+    let mut files_vec: Vec<(RepoPathBuf, MismatchReason)> = files.into_iter().collect();
+    files_vec.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files_vec)
+}
+
+struct DirectoryToVisit2<'a> {
+    dir: RepoPathBuf,
+    disk_dir: PathBuf,
+    git_ignore_old: Arc<GitIgnoreFile>,
+    // null means the gitignore in this or a parent dir was conflicted,
+    // and we're assuming nothing is ignored in this subdir in the new tree
+    git_ignore_new: Option<Arc<GitIgnoreFile>>,
+    new_tree: &'a MergedTree,
+    old_tree: &'a MergedTree,
+    file_states: FileStates<'a>,
+}
+
+struct MismatchedIgnoredFilesCollector<'a> {
+    error: OnceLock<SnapshotError>,
+    progress: Option<&'a SnapshotProgress<'a>>,
+    file_tx: Sender<(RepoPathBuf, MismatchReason)>,
+    tree_state: &'a TreeState,
+}
+
+impl MismatchedIgnoredFilesCollector<'_> {
+    fn spawn_ok<'scope, F>(&'scope self, scope: &rayon::Scope<'scope>, body: F)
+    where
+        F: FnOnce(&rayon::Scope<'scope>) -> Result<(), SnapshotError> + Send + 'scope,
+    {
+        scope.spawn(|scope| {
+            if self.error.get().is_some() {
+                return;
+            }
+            match body(scope) {
+                Ok(()) => {}
+                Err(err) => self.error.set(err).unwrap_or(()),
+            }
+        });
+    }
+
+    fn into_result(self) -> Result<(), SnapshotError> {
+        match self.error.into_inner() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn visit_directory<'scope>(
+        &'scope self,
+        directory_to_visit: DirectoryToVisit2<'scope>,
+        scope: &rayon::Scope<'scope>,
+    ) -> Result<(), SnapshotError> {
+        let DirectoryToVisit2 {
+            dir,
+            disk_dir,
+            git_ignore_old,
+            git_ignore_new,
+            new_tree,
+            old_tree,
+            file_states,
+        } = directory_to_visit;
+
+        let git_ignore_old =
+            git_ignore_old.chain_with_file(dir.as_ref(), disk_dir.join(".gitignore"))?;
+        let git_ignore_new = chain_ignores_from_tree(
+            git_ignore_new,
+            new_tree,
+            dir.as_ref(),
+            &disk_dir,
+            &git_ignore_old,
+        )?;
+
+        let new_subtrees = new_tree
+            .trees()
+            .block_on()
+            .ok()
+            .and_then(|t| t.sub_tree_recursive(dir.as_ref()).block_on().ok().flatten());
+
+        let mut names = HashSet::new();
+        if disk_dir.is_dir() {
+            if let Ok(entries) = disk_dir.read_dir() {
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        if let Some(subtrees) = &new_subtrees {
+            for (name, _) in crate::merged_tree::all_tree_entries(subtrees) {
+                names.insert(name.as_internal_str().to_owned());
+            }
+        }
+
+        names
+            .into_iter()
+            .collect::<Vec<String>>()
+            .into_par_iter()
+            // Don't split into too many small jobs. For a small directory,
+            // sequential scan should be fast enough.
+            .with_min_len(100)
+            .map(|name_string| {
+                self.process_entry(
+                    &dir,
+                    &git_ignore_old,
+                    &git_ignore_new,
+                    file_states,
+                    new_tree,
+                    old_tree,
+                    name_string,
+                    &disk_dir,
+                    &new_subtrees,
+                    scope,
+                )
+            })
+            .collect::<Result<(), SnapshotError>>()?;
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn process_entry<'scope>(
+        &'scope self,
+        dir: &RepoPath,
+        git_ignore_old: &Arc<GitIgnoreFile>,
+        git_ignore_new: &Option<Arc<GitIgnoreFile>>,
+        file_states: FileStates<'scope>,
+        new_tree: &'scope MergedTree,
+        old_tree: &'scope MergedTree,
+        name_string: String,
+        disk_dir: &Path,
+        new_subtrees: &Option<Merge<crate::tree::Tree>>,
+        scope: &rayon::Scope<'scope>,
+    ) -> Result<(), SnapshotError> {
+        if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
+            return Ok(());
+        }
+        let name = RepoPathComponent::new(&name_string).unwrap();
+        let path = dir.join(name);
+        let maybe_current_file_state = file_states.get_at(dir, name);
+        if let Some(file_state) = &maybe_current_file_state
+            && file_state.file_type == FileType::GitSubmodule
+        {
+            return Ok(());
+        }
+
+        let entry_path = disk_dir.join(&name_string);
+        let metadata = entry_path.symlink_metadata().ok();
+        let is_dir = metadata.as_ref().map_or(false, |m| m.is_dir())
+            || new_subtrees.as_ref().map_or(false, |subtrees| {
+                crate::merged_tree::all_tree_entries(subtrees)
+                    .any(|(n, val)| n == name && val.is_tree())
+            });
+
+        if is_dir {
+            let file_states = file_states.prefixed_at(dir, name);
+            // If a submodule was added in commit C, and a user decides to run
+            // `jj new <something before C>` from after C, then the submodule
+            // files stick around but it is no longer seen as a submodule.
+            // We need to ensure that it is not tracked as if it was added to
+            // the main repo.
+            // See https://github.com/jj-vcs/jj/issues/4349.
+            // To solve this, we ignore all nested repos entirely.
+            for &name in RESERVED_DIR_NAMES {
+                if entry_path.join(name).symlink_metadata().is_ok() {
+                    return Ok(());
+                }
+            }
+
+            let directory_to_visit = DirectoryToVisit2 {
+                dir: path,
+                disk_dir: entry_path,
+                git_ignore_old: git_ignore_old.clone(),
+                git_ignore_new: git_ignore_new.clone(),
+                new_tree,
+                old_tree,
+                file_states,
+            };
+            self.spawn_ok(scope, |scope| {
+                self.visit_directory(directory_to_visit, scope)
+            });
+        } else {
+            if let Some(progress) = self.progress {
+                progress(&path);
+            }
+            let reason: Option<MismatchReason>;
+            if git_ignore_old.matches_file(&path) {
+                reason = match git_ignore_new {
+                    None => Some(MismatchReason::Added),
+                    Some(git_ignore) => {
+                        let is_tracked_in_new = new_tree
+                            .path_value(&path)
+                            .block_on()
+                            .map_or(false, |v| v.is_present());
+                        if git_ignore.matches_file(&path) {
+                            if is_tracked_in_new {
+                                Some(MismatchReason::Deleted)
+                            } else {
+                                None
+                            }
+                        } else {
+                            if is_tracked_in_new {
+                                // If a .gitignore ignores itself (and another file), and we
+                                // checkout another commit where that file was _not_ ignored,
+                                // it now _will_ be ignored!
+                                // A snapshot will cause an implicit edit, which we don't want.
+                                let is_identical = (|| {
+                                    let new_val = new_tree.path_value(&path).block_on().ok()?;
+                                    let Some(TreeValue::File { id, .. }) = new_val.as_resolved()?
+                                    else {
+                                        return Some(false);
+                                    };
+                                    let mut file_reader = self
+                                        .tree_state
+                                        .store
+                                        .read_file(&path, id)
+                                        .block_on()
+                                        .ok()?;
+                                    let mut expected_contents = Vec::new();
+                                    file_reader
+                                        .read_to_end(&mut expected_contents)
+                                        .block_on()
+                                        .ok()?;
+
+                                    let disk_path =
+                                        path.to_fs_path(&self.tree_state.working_copy_path).ok()?;
+                                    let file = File::open(disk_path).ok()?;
+                                    let mut converted_contents = Vec::new();
+                                    self.tree_state
+                                        .target_eol_strategy
+                                        .convert_eol_for_snapshot(AllowStdIo::new(file))
+                                        .block_on()
+                                        .ok()?
+                                        .read_to_end(&mut converted_contents)
+                                        .block_on()
+                                        .ok()?;
+                                    Some(converted_contents == expected_contents)
+                                })()
+                                .unwrap_or(false);
+                                if is_identical {
+                                    None
+                                } else {
+                                    Some(MismatchReason::Conflict)
+                                }
+                            } else {
+                                Some(MismatchReason::Added)
+                            }
+                        }
+                    }
+                };
+            } else {
+                reason = if let Some(git_ignore) = git_ignore_new
+                    && git_ignore.matches_file(&path)
+                {
+                    let is_tracked_in_new = new_tree
+                        .path_value(&path)
+                        .block_on()
+                        .map_or(false, |v| v.is_present());
+                    if is_tracked_in_new {
+                        Some(MismatchReason::Deleted)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            }
+            if let Some(reason) = reason {
+                self.file_tx.send((path, reason)).ok();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn chain_ignores_from_tree(
+    maybe_git_ignore: Option<Arc<GitIgnoreFile>>,
+    tree: &MergedTree,
+    dir: &RepoPath,
+    disk_dir: &PathBuf,
+    git_ignore_old: &Arc<GitIgnoreFile>,
+) -> Result<Option<Arc<GitIgnoreFile>>, SnapshotError> {
+    if maybe_git_ignore.is_none() {
+        return Ok(None);
+    }
+    let git_ignore = maybe_git_ignore.unwrap();
+    // should return (git_ignore_new: GitIgnoreFile,
+    // conservatively_treat_as_nothing_ignored: bool)
+    let gitignore_path_component = RepoPathComponent::new(".gitignore");
+    if let Err(err) = gitignore_path_component {
+        return Err(SnapshotError::Other {
+            message: "Failed to create `RepoPathComponent` for root `.gitignore`".to_string(),
+            err: Box::new(err),
+        });
+    }
+    let gitignore_path = dir.join(gitignore_path_component.unwrap());
+    let disk_gitignore = disk_dir.join(".gitignore");
+    let path_merge = tree.path_value(&gitignore_path).block_on()?;
+    if path_merge.is_absent() {
+        return fallback_gitignore(
+            git_ignore,
+            git_ignore_old,
+            dir,
+            &gitignore_path,
+            disk_gitignore,
+        );
+    }
+    let maybe_file_merge = path_merge.to_file_merge();
+    if maybe_file_merge.is_none() {
+        // One of the merge values is not a file.
+        // Conservatively treat this as there being no ignore file.
+        return fallback_gitignore(
+            git_ignore,
+            git_ignore_old,
+            dir,
+            &gitignore_path,
+            disk_gitignore,
+        );
+    }
+    let file_merge = maybe_file_merge.unwrap();
+    let maybe_resolved_file_merge = file_merge.resolve_trivial(SameChange::Accept);
+    if maybe_resolved_file_merge.is_none() {
+        // `.gitignore` is conflicted.
+        // Conservatively tread this as there being no ignore file.
+        return fallback_gitignore(
+            git_ignore,
+            git_ignore_old,
+            dir,
+            &gitignore_path,
+            disk_gitignore,
+        );
+    }
+    let resolve_file_merge = maybe_resolved_file_merge.unwrap();
+    if let Some(file_id) = resolve_file_merge {
+        let mut file_reader = tree
+            .store()
+            .backend()
+            .read_file(gitignore_path.as_ref(), file_id)
+            .block_on()?;
+        let mut buf = Vec::<u8>::new();
+        if let Err(err) = file_reader.read_to_end(&mut buf).block_on() {
+            return Err(SnapshotError::Other {
+                message: "Failed to read `.gitignore`".to_string(),
+                err: Box::new(err),
+            });
+        }
+        return Ok(Some(git_ignore.chain(
+            &dir,
+            disk_gitignore.as_ref(),
+            &buf,
+        )?));
+    }
+
+    // there is nothing at this path in the new tree
+    return fallback_gitignore(
+        git_ignore,
+        git_ignore_old,
+        dir,
+        &gitignore_path,
+        disk_gitignore,
+    );
+}
+
+fn fallback_gitignore(
+    git_ignore: Arc<GitIgnoreFile>,
+    git_ignore_old: &Arc<GitIgnoreFile>,
+    dir: &RepoPath,
+    gitignore_path: &RepoPathBuf,
+    disk_gitignore: PathBuf,
+) -> Result<Option<Arc<GitIgnoreFile>>, SnapshotError> {
+    if disk_gitignore.is_file() && git_ignore_old.matches_file(&gitignore_path) {
+        return Ok(Some(git_ignore.chain_with_file(dir, disk_gitignore)?));
+    }
+    return Ok(Some(git_ignore));
 }
 
 #[cfg(test)]

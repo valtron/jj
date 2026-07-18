@@ -73,6 +73,7 @@ use jj_lib::fileset::FilesetAliasesMap;
 use jj_lib::fileset::FilesetDiagnostics;
 use jj_lib::fileset::FilesetExpression;
 use jj_lib::fileset::FilesetParseContext;
+use jj_lib::git_backend::base_ignores;
 use jj_lib::gitignore::GitIgnoreError;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::id_prefix::IdPrefixContext;
@@ -1596,54 +1597,8 @@ to the current parents may contain changes from multiple commits.
         self.env.path_converter()
     }
 
-    #[cfg(not(feature = "git"))]
     pub fn base_ignores(&self) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
-        Ok(GitIgnoreFile::empty())
-    }
-
-    #[cfg(feature = "git")]
-    #[instrument(skip_all)]
-    pub fn base_ignores(&self) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
-        let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
-            // TODO: maybe use path() and interpolate(), which can process non-utf-8
-            // path on Unix.
-            if let Some(value) = config.string("core.excludesFile") {
-                let path = str::from_utf8(&value)
-                    .ok()
-                    .map(jj_lib::file_util::expand_home_path)?;
-                // The configured path is usually absolute, but if it's relative,
-                // the "git" command would read the file at the work-tree directory.
-                Some(self.workspace_root().join(path))
-            } else {
-                xdg_config_home().map(|x| x.join("git").join("ignore"))
-            }
-        };
-
-        fn xdg_config_home() -> Option<PathBuf> {
-            if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
-                && !x.is_empty()
-            {
-                return Some(PathBuf::from(x));
-            }
-            etcetera::home_dir().ok().map(|home| home.join(".config"))
-        }
-
-        let mut git_ignores = GitIgnoreFile::empty();
-        if let Ok(git_backend) = jj_lib::git::get_git_backend(self.repo().store()) {
-            let git_repo = git_backend.git_repo();
-            if let Some(excludes_file_path) = get_excludes_file_path(&git_repo.config_snapshot()) {
-                git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
-            }
-            git_ignores = git_ignores.chain_with_file(
-                RepoPath::root(),
-                git_backend.git_repo_path().join("info").join("exclude"),
-            )?;
-        } else if let Ok(git_config) = gix::config::File::from_globals()
-            && let Some(excludes_file_path) = get_excludes_file_path(&git_config)
-        {
-            git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
-        }
-        Ok(git_ignores)
+        base_ignores(self.workspace_root(), self.repo().store())
     }
 
     /// Creates textual diff renderer of the specified `formats`.
@@ -2291,13 +2246,7 @@ to the current parents may contain changes from multiple commits.
             crate::git_util::print_git_export_stats(ui, &stats)?;
         }
 
-        self.user_repo = ReadonlyUserRepo::new(
-            self.env
-                .command
-                .maybe_commit_transaction(tx, description)
-                .await?,
-        );
-
+        let unpublished_op = tx.write(description).await?;
         // Update working copy before reporting repo changes, so that
         // potential errors while reporting changes (broken pipe, etc)
         // don't leave the working copy in a stale state.
@@ -2310,10 +2259,12 @@ to the current parents may contain changes from multiple commits.
                 // update it.
             }
         }
-
         self.report_repo_changes(ui, &old_repo).await?;
 
-        if !self.env.command.should_commit_transaction() {
+        if self.env.command.should_commit_transaction() {
+            self.user_repo = ReadonlyUserRepo::new(unpublished_op.publish().await?);
+        } else {
+            self.user_repo = ReadonlyUserRepo::new(unpublished_op.leave_unpublished());
             writeln!(
                 ui.status(),
                 "Operation left uncommitted because --no-integrate-operation was requested: {}",
@@ -2946,15 +2897,46 @@ async fn update_stale_working_copy(
         .locked_wc()
         .check_out(new_commit)
         .await
-        .map_err(|err| {
-            internal_error_with_message(
-                format!("Failed to check out commit {}", new_commit.id().hex()),
-                err,
-            )
-        })?;
+        .map_err(|err| map_checkout_error(err, new_commit))?;
     locked_ws.finish(op_id).await?;
 
     Ok(stats)
+}
+
+fn map_checkout_error(
+    err: jj_lib::working_copy::CheckoutError,
+    new_commit: &Commit,
+) -> CommandError {
+    let msg = format!("Failed to check out commit {}", new_commit.id().hex());
+    match &err {
+        jj_lib::working_copy::CheckoutError::IgnoredFilesMismatched { files } => {
+            let hint = format_mismatched_ignored_files_hint(files);
+            user_error_with_message(msg, err).hinted(hint)
+        }
+        _ => internal_error_with_message(msg, err),
+    }
+}
+
+fn format_mismatched_ignored_files_hint(
+    files: &[(RepoPathBuf, jj_lib::working_copy::MismatchReason)],
+) -> String {
+    let mut hint = "Relevant files:\n".to_string();
+    for (path, reason) in files.iter().take(10) {
+        let prefix = match reason {
+            jj_lib::working_copy::MismatchReason::Added => "+",
+            jj_lib::working_copy::MismatchReason::Deleted => "-",
+            jj_lib::working_copy::MismatchReason::Conflict => "!",
+        };
+        hint.push_str(&format!("  {} {}", prefix, path.as_internal_file_string()));
+        hint.push('\n');
+    }
+    if files.len() > 10 {
+        hint.push_str(&format!("  ({} more files)\n", files.len() - 10));
+    }
+    if hint.ends_with('\n') {
+        hint.pop();
+    }
+    hint
 }
 
 /// Prints a list of commits by the given summary template. The list may be
@@ -3242,12 +3224,7 @@ pub async fn update_working_copy(
     let stats = workspace
         .check_out(repo.op_id().clone(), old_tree.as_ref(), new_commit)
         .await
-        .map_err(|err| {
-            internal_error_with_message(
-                format!("Failed to check out commit {}", new_commit.id().hex()),
-                err,
-            )
-        })?;
+        .map_err(|err| map_checkout_error(err, new_commit))?;
     Ok(stats)
 }
 
@@ -3551,7 +3528,7 @@ async fn ensure_no_commit_loop(
 /// [`jj help -k tutorial`]:
 ///     https://docs.jj-vcs.dev/latest/tutorial/
 #[derive(clap::Parser, Clone, Debug)]
-#[command(name = "jj")]
+#[command(name = "jj-better-ignores")]
 pub struct Args {
     #[command(flatten)]
     pub global_args: GlobalArgs,

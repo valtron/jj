@@ -303,6 +303,13 @@ pub enum CheckoutError {
     /// Failed to load the working copy state.
     #[error(transparent)]
     WorkingCopyStateError(#[from] WorkingCopyStateError),
+    /// There is a mismatch in the set of ignored files between the
+    /// current working copy and the one being checked out.
+    #[error("Working copy contains ignored files that would be overwritten or deleted")]
+    IgnoredFilesMismatched {
+        /// The files that have mismatched ignored status.
+        files: Vec<(RepoPathBuf, MismatchReason)>,
+    },
     /// Some other error happened while checking out the working copy.
     #[error("{message}")]
     Other {
@@ -449,6 +456,17 @@ pub async fn create_and_check_out_recovery_commit(
     locked_wc.recover(&new_commit).await?;
 
     Ok((repo, new_commit))
+}
+
+/// The reason why an ignored file is mismatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MismatchReason {
+    /// An ignored file in the WC is not ignored in the target commit.
+    Added,
+    /// A file in the target commit has become ignored.
+    Deleted,
+    /// An ignored file in the WC conflicts with the target commit.
+    Conflict,
 }
 
 /// An error while reading the working copy state.

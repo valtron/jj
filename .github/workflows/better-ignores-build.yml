@@ -1,0 +1,39 @@
+name: Better Ignores Build
+
+on:
+  push:
+    branches:
+      - better-ignores
+
+permissions: read-all
+
+jobs:
+  build-windows:
+    name: Build and Test Windows Release
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Windows Builders
+        uses: ./.github/actions/setup-windows
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release Binary
+        run: cargo build --release --bin jj
+
+      - name: Run Gitignore Tests
+        run: cargo test -p jj-cli --test runner test_gitignores_ --release
+        env:
+          RUST_BACKTRACE: 1
+          CARGO_TERM_COLOR: always
+
+      - name: Upload jj.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jj-windows-release
+          path: target/release/jj.exe
