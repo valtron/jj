@@ -418,7 +418,8 @@ pub type TreeEntriesStream<'matcher> =
 /// ones) can fetch trees asynchronously.
 pub type TreeDiffStream<'matcher> = BoxStream<'matcher, TreeDiffEntry>;
 
-fn all_tree_entries(
+/// Returns an iterator over all entries in the merged trees.
+pub fn all_tree_entries(
     trees: &Merge<Tree>,
 ) -> impl Iterator<Item = (&RepoPathComponent, MergedTreeVal<'_>)> {
     if let Some(tree) = trees.as_resolved() {

@@ -51,7 +51,7 @@ use crate::ui::Ui;
 ///
 /// [tutorial]: https://docs.jj-vcs.dev/latest/tutorial/
 #[derive(clap::Parser, Clone, Debug)]
-#[command(name = "jj")]
+#[command(name = "jj-better-ignores")]
 pub struct Args {
     #[command(flatten)]
     pub global_args: GlobalArgs,
